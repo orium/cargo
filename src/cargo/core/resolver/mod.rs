@@ -56,6 +56,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use rpds::{HashTrieMap, HashTrieSet};
 use semver;
 use url::Url;
 
@@ -366,12 +367,9 @@ enum GraphNode {
 // possible.
 #[derive(Clone)]
 struct Context {
-    // TODO: Both this and the two maps below are super expensive to clone. We should
-    //       switch to persistent hash maps if we can at some point or otherwise
-    //       make these much cheaper to clone in general.
-    activations: Activations,
-    resolve_features: HashMap<PackageId, HashSet<InternedString>>,
-    links: HashMap<InternedString, PackageId>,
+    activations_: Activations,
+    resolve_features_: HashTrieMap<PackageId, HashTrieSet<InternedString>>,
+    links_: HashTrieMap<InternedString, PackageId>,
 
     // These are two cheaply-cloneable lists (O(1) clone) which are effectively
     // hash maps but are built up as "construction lists". We'll iterate these
@@ -383,7 +381,7 @@ struct Context {
     warnings: RcList<String>,
 }
 
-type Activations = HashMap<(InternedString, SourceId), Rc<Vec<Summary>>>;
+type Activations = HashTrieMap<(InternedString, SourceId), Rc<Vec<Summary>>>;
 
 /// Builds the list of all packages required to build the first argument.
 ///
@@ -424,10 +422,10 @@ pub fn resolve(
 ) -> CargoResult<Resolve> {
     let cx = Context {
         resolve_graph: RcList::new(),
-        resolve_features: HashMap::new(),
-        links: HashMap::new(),
+        resolve_features_: HashTrieMap::new(),
+        links_: HashTrieMap::new(),
         resolve_replacements: RcList::new(),
-        activations: HashMap::new(),
+        activations_: HashTrieMap::new(),
         warnings: RcList::new(),
     };
     let _p = profile::start("resolving");
@@ -444,21 +442,21 @@ pub fn resolve(
         checksums: HashMap::new(),
         metadata: BTreeMap::new(),
         replacements: cx.resolve_replacements(),
-        features: cx.resolve_features
+        features: cx.resolve_features_
             .iter()
             .map(|(k, v)| (k.clone(), v.iter().map(|x| x.to_string()).collect()))
             .collect(),
         unused_patches: Vec::new(),
     };
 
-    for summary in cx.activations.values().flat_map(|v| v.iter()) {
+    for summary in cx.activations_.values().flat_map(|v| v.iter()) {
         let cksum = summary.checksum().map(|s| s.to_string());
         resolve
             .checksums
             .insert(summary.package_id().clone(), cksum);
     }
 
-    check_cycles(&resolve, &cx.activations)?;
+    check_cycles(&resolve, &cx.activations_)?;
     trace!("resolved: {:?}", resolve);
 
     // If we have a shell, emit warnings about required deps used as feature.
@@ -910,7 +908,7 @@ impl RemainingCandidates {
             // `links` key. If this candidate links to something that's already
             // linked to by a different package then we've gotta skip this.
             if let Some(link) = b.summary.links() {
-                if let Some(a) = cx.links.get(&link) {
+                if let Some(a) = cx.links_.get(&link) {
                     if a != b.summary.package_id() {
                         self.conflicting_prev_active
                             .entry(a.clone())
@@ -1811,24 +1809,38 @@ impl Context {
     /// Returns true if this summary with the given method is already activated.
     fn flag_activated(&mut self, summary: &Summary, method: &Method) -> CargoResult<bool> {
         let id = summary.package_id();
-        let prev = self.activations
-            .entry((id.name(), id.source_id().clone()))
-            .or_insert_with(|| Rc::new(Vec::new()));
+        let key = (id.name(), id.source_id().clone());
+        let prev = self.activations_.get(&key)
+            .map(|v| Rc::clone(v))
+            .unwrap_or_else(|| Rc::new(Vec::new()));
+
         if !prev.iter().any(|c| c == summary) {
             self.resolve_graph.push(GraphNode::Add(id.clone()));
             if let Some(link) = summary.links() {
+                let size_before = self.links_.size();
+
+                self.links_ = self.links_.insert(link, id.clone());
+
+                let existed = size_before == self.links_.size();
+
                 ensure!(
-                    self.links.insert(link, id.clone()).is_none(),
+                    !existed,
                     "Attempting to resolve a with more then one crate with the links={}. \n\
                      This will not build as is. Consider rebuilding the .lock file.",
                     &*link
                 );
             }
-            let mut inner: Vec<_> = (**prev).clone();
+
+            let mut inner: Vec<_> = Vec::clone(&prev);
             inner.push(summary.clone());
-            *prev = Rc::new(inner);
+
+            self.activations_ = self.activations_.insert(key, Rc::new(inner));
+
             return Ok(false);
+        } else {
+            self.activations_ = self.activations_.insert(key, prev);
         }
+
         debug!("checking if {} is already activated", summary.package_id());
         let (features, use_default) = match *method {
             Method::Everything
@@ -1843,7 +1855,7 @@ impl Context {
         };
 
         let has_default_feature = summary.features().contains_key("default");
-        Ok(match self.resolve_features.get(id) {
+        Ok(match self.resolve_features_.get(id) {
             Some(prev) => {
                 features
                     .iter()
@@ -1886,14 +1898,14 @@ impl Context {
     }
 
     fn prev_active(&self, dep: &Dependency) -> &[Summary] {
-        self.activations
+        self.activations_
             .get(&(dep.name(), dep.source_id().clone()))
             .map(|v| &v[..])
             .unwrap_or(&[])
     }
 
     fn is_active(&self, id: &PackageId) -> bool {
-        self.activations
+        self.activations_
             .get(&(id.name(), id.source_id().clone()))
             .map(|v| v.iter().any(|s| s.package_id() == id))
             .unwrap_or(false)
@@ -1985,12 +1997,17 @@ impl Context {
         if !reqs.used.is_empty() {
             let pkgid = s.package_id();
 
-            let set = self.resolve_features
-                .entry(pkgid.clone())
-                .or_insert_with(HashSet::new);
+            let mut set = self.resolve_features_
+                .get(pkgid)
+                .map(|v| v.clone())
+                .unwrap_or_else(|| HashTrieSet::new());
+
             for feature in reqs.used {
-                set.insert(InternedString::new(feature));
+                set = set.insert(InternedString::new(feature));
             }
+
+            self.resolve_features_ = self.resolve_features_
+                .insert(pkgid.clone(), set);
         }
 
         Ok(ret)
