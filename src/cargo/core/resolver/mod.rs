@@ -1010,6 +1010,8 @@ fn activate_deps_loop(
     let mut printed = false;
     let mut deps_time = Duration::new(0, 0);
 
+    let _p = profile::start("resolve-main-loop");
+
     // Main resolution loop, this is the workhorse of the resolution algorithm.
     //
     // You'll note that a few stacks are maintained on the side, which might
@@ -1041,6 +1043,18 @@ fn activate_deps_loop(
                 printed = true;
                 config.shell().status("Resolving", "dependency graph...")?;
             }
+        }
+
+        if ticks % 1000000 == 0 {
+            let e = start.elapsed();
+            println!("{} ticks, {}s, {:.3} ticks/ms, {}, {}",
+                     ticks,
+                     e.as_secs(),
+                     ticks as f32 / (e.as_secs() as f32 * 1000.0),
+                     cx.activations.iter().map(|x| x.1.len()).sum::<usize>(),
+                     // past_conflicting_activations.iter().map(|x| x.1.len()).sum::<usize>(),
+                     remaining_deps.len(),
+            );
         }
 
         let just_here_for_the_error_messages = deps_frame.just_for_error_messages;
@@ -1262,7 +1276,8 @@ fn activate_deps_loop(
                     // dependency can't be activated which implies that we
                     // ourselves are incompatible with that dep, so we know that deps
                     // parent conflict with us.
-                    if !has_past_conflicting_dep {
+                    // WIP WIP WIP WIP WIP WIP
+                    if false && !has_past_conflicting_dep {
                         if let Some(known_related_bad_deps) =
                             past_conflicting_activations.dependencies_conflicting_with(&pid)
                         {
